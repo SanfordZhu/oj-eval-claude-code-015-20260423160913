@@ -13,35 +13,6 @@ const char* DB_FILE = "database.dat";
 const int NUM_BUCKETS = 10007;  // Prime number for hashing
 const int BLOCK_SIZE = 512;  // Fixed block size
 
-// Fixed-size block stored on disk
-struct Block {
-    int pos;  // File position
-    int next_block_pos;  // Position of next block in chain (-1 if none)
-    int num_entries;
-
-    struct Entry {
-        bool deleted;
-        string key;
-        int value;
-
-        int size() const {
-            return 1 + 1 + key.size() + 4;  // deleted + key_len + key + value
-        }
-    };
-
-    vector<Entry> entries;
-
-    Block() : pos(-1), next_block_pos(-1), num_entries(0) {}
-
-    int data_size() const {
-        int sz = 0;
-        for (const auto& e : entries) {
-            sz += e.size();
-        }
-        return sz;
-    }
-};
-
 fstream db_file;
 int bucket_pos[NUM_BUCKETS];  // Position of first block for each bucket
 int next_pos = 0;
@@ -56,14 +27,12 @@ void open_db() {
         db_file.read(reinterpret_cast<char*>(bucket_pos), NUM_BUCKETS * 4);
         db_file.read(reinterpret_cast<char*>(&next_pos), 4);
     } else {
-        // Create new file
         db_file.open(DB_FILE, ios::binary | ios::out | ios::trunc);
         memset(bucket_pos, -1, sizeof(bucket_pos));
-        next_pos = NUM_BUCKETS * 4 + 4;  // Start after header
+        next_pos = NUM_BUCKETS * 4 + 4;
         db_file.write(reinterpret_cast<char*>(bucket_pos), NUM_BUCKETS * 4);
         db_file.write(reinterpret_cast<char*>(&next_pos), 4);
         db_file.close();
-        // Reopen for read/write
         db_file.open(DB_FILE, ios::binary | ios::in | ios::out);
     }
 }
@@ -77,51 +46,6 @@ void close_db() {
     db_file.close();
 }
 
-Block* read_block(int pos) {
-    if (pos < 0) return nullptr;
-    Block* block = new Block();
-    block->pos = pos;
-    db_file.clear();
-    db_file.seekg(pos);
-
-    db_file.read(reinterpret_cast<char*>(&block->next_block_pos), 4);
-    db_file.read(reinterpret_cast<char*>(&block->num_entries), 4);
-
-    for (int i = 0; i < block->num_entries; i++) {
-        Block::Entry e;
-        uint8_t deleted, key_len;
-        db_file.read(reinterpret_cast<char*>(&deleted), 1);
-        db_file.read(reinterpret_cast<char*>(&key_len), 1);
-        e.deleted = (deleted != 0);
-        e.key.resize(key_len);
-        db_file.read(&e.key[0], key_len);
-        db_file.read(reinterpret_cast<char*>(&e.value), 4);
-        block->entries.push_back(e);
-    }
-
-    return block;
-}
-
-void write_block(Block* block) {
-    int pos = block->pos;
-
-    db_file.clear();
-    db_file.seekp(pos);
-
-    db_file.write(reinterpret_cast<char*>(&block->next_block_pos), 4);
-    db_file.write(reinterpret_cast<char*>(&block->num_entries), 4);
-
-    for (const auto& e : block->entries) {
-        uint8_t deleted = e.deleted ? 1 : 0;
-        uint8_t key_len = e.key.size();
-        db_file.write(reinterpret_cast<char*>(&deleted), 1);
-        db_file.write(reinterpret_cast<char*>(&key_len), 1);
-        db_file.write(e.key.c_str(), key_len);
-        db_file.write(reinterpret_cast<const char*>(&e.value), 4);
-    }
-    db_file.flush();
-}
-
 unsigned int hash_key(const string& key) {
     unsigned int h = 5381;
     for (char c : key) {
@@ -130,75 +54,131 @@ unsigned int hash_key(const string& key) {
     return h % NUM_BUCKETS;
 }
 
+// Read block header and return data position and next block pos
+bool read_block_header(int pos, int& next_block, int& num_entries, int& data_start) {
+    if (pos < 0) return false;
+    db_file.clear();
+    db_file.seekg(pos);
+    db_file.read(reinterpret_cast<char*>(&next_block), 4);
+    db_file.read(reinterpret_cast<char*>(&num_entries), 4);
+    data_start = pos + 8;
+    return true;
+}
+
+// Read a single entry from data position
+bool read_entry(int& pos, bool& deleted, string& key, int& value) {
+    uint8_t del, key_len;
+    if (!db_file.read(reinterpret_cast<char*>(&del), 1)) return false;
+    if (!db_file.read(reinterpret_cast<char*>(&key_len), 1)) return false;
+    deleted = (del != 0);
+    key.resize(key_len);
+    if (key_len > 0 && !db_file.read(&key[0], key_len)) return false;
+    if (!db_file.read(reinterpret_cast<char*>(&value), 4)) return false;
+    pos += 1 + 1 + key_len + 4;
+    return true;
+}
+
+// Write block header
+void write_block_header(int pos, int next_block, int num_entries) {
+    db_file.clear();
+    db_file.seekp(pos);
+    db_file.write(reinterpret_cast<char*>(&next_block), 4);
+    db_file.write(reinterpret_cast<char*>(&num_entries), 4);
+}
+
+// Write an entry at position
+int write_entry(int pos, bool deleted, const string& key, int value) {
+    db_file.clear();
+    db_file.seekp(pos);
+    uint8_t del = deleted ? 1 : 0;
+    uint8_t key_len = key.size();
+    db_file.write(reinterpret_cast<char*>(&del), 1);
+    db_file.write(reinterpret_cast<char*>(&key_len), 1);
+    db_file.write(key.c_str(), key_len);
+    db_file.write(reinterpret_cast<char*>(&value), 4);
+    db_file.flush();
+    return pos + 1 + 1 + key_len + 4;
+}
+
+// Calculate entry size
+int entry_size(const string& key) {
+    return 1 + 1 + key.size() + 4;  // deleted + key_len + key + value
+}
+
 void insert(const string& key, int value) {
     unsigned int bucket = hash_key(key);
+    int entry_sz = entry_size(key);
 
     // Check if entry already exists
     int pos = bucket_pos[bucket];
     while (pos >= 0) {
-        Block* block = read_block(pos);
-        for (auto& e : block->entries) {
-            if (!e.deleted && e.key == key && e.value == value) {
-                delete block;
+        int next_block, num_entries, data_start;
+        if (!read_block_header(pos, next_block, num_entries, data_start)) break;
+
+        int read_pos = data_start;
+        for (int i = 0; i < num_entries; i++) {
+            bool deleted;
+            string k;
+            int v;
+            if (!read_entry(read_pos, deleted, k, v)) break;
+            if (!deleted && k == key && v == value) {
                 return;  // Already exists
             }
         }
-        pos = block->next_block_pos;
-        delete block;
+        pos = next_block;
     }
 
     // Find a block with space or create new one
     pos = bucket_pos[bucket];
-    Block* last_block = nullptr;
     int last_pos = -1;
+    int last_next = -1;
 
     while (pos >= 0) {
-        Block* block = read_block(pos);
-        int header_size = 8;  // next_block_pos + num_entries
-        int new_entry_size = 1 + 1 + key.size() + 4;  // deleted + key_len + key + value
-        if (block->data_size() + new_entry_size + header_size <= BLOCK_SIZE) {
-            // Has space
-            Block::Entry e;
-            e.deleted = false;
-            e.key = key;
-            e.value = value;
-            block->entries.push_back(e);
-            block->num_entries++;
-            write_block(block);
-            delete block;
+        int next_block, num_entries, data_start;
+        if (!read_block_header(pos, next_block, num_entries, data_start)) break;
+
+        int data_sz = 0;
+        int read_pos = data_start;
+        for (int i = 0; i < num_entries; i++) {
+            bool deleted;
+            string k;
+            int v;
+            if (!read_entry(read_pos, deleted, k, v)) break;
+            data_sz += entry_size(k);
+        }
+
+        if (data_sz + entry_sz + 8 <= BLOCK_SIZE) {
+            // Has space - append entry
+            int write_pos = data_start + data_sz;
+            write_entry(write_pos, false, key, value);
+            write_block_header(pos, next_block, num_entries + 1);
             return;
         }
+
         last_pos = pos;
-        pos = block->next_block_pos;
-        delete last_block;
-        last_block = block;
+        last_next = next_block;
+        pos = next_block;
     }
 
     // Need new block
-    Block* new_block = new Block();
-    new_block->pos = next_pos;
+    int new_pos = next_pos;
     next_pos += BLOCK_SIZE;
-    Block::Entry e;
-    e.deleted = false;
-    e.key = key;
-    e.value = value;
-    new_block->entries.push_back(e);
-    new_block->num_entries = 1;
-    write_block(new_block);
+    write_block_header(new_pos, -1, 1);
+    write_entry(new_pos + 8, false, key, value);
 
-    if (last_block) {
-        last_block->next_block_pos = new_block->pos;
-        write_block(last_block);
-        delete last_block;
+    if (last_pos >= 0) {
+        write_block_header(last_pos, new_pos, 0);  // Will update num_entries below
+        // Need to read and rewrite header with correct num_entries
+        int next_block, num_entries, data_start;
+        read_block_header(last_pos, next_block, num_entries, data_start);
+        write_block_header(last_pos, new_pos, num_entries);
     } else {
-        bucket_pos[bucket] = new_block->pos;
-        // Write bucket positions back to header
+        bucket_pos[bucket] = new_pos;
         db_file.clear();
         db_file.seekp(bucket * 4);
         db_file.write(reinterpret_cast<char*>(&bucket_pos[bucket]), 4);
         db_file.flush();
     }
-    delete new_block;
 }
 
 void delete_entry(const string& key, int value) {
@@ -206,17 +186,27 @@ void delete_entry(const string& key, int value) {
     int pos = bucket_pos[bucket];
 
     while (pos >= 0) {
-        Block* block = read_block(pos);
-        for (auto& e : block->entries) {
-            if (!e.deleted && e.key == key && e.value == value) {
-                e.deleted = true;
-                write_block(block);
-                delete block;
+        int next_block, num_entries, data_start;
+        if (!read_block_header(pos, next_block, num_entries, data_start)) break;
+
+        int read_pos = data_start;
+        for (int i = 0; i < num_entries; i++) {
+            bool deleted;
+            string k;
+            int v;
+            int entry_start = read_pos;
+            if (!read_entry(read_pos, deleted, k, v)) break;
+            if (!deleted && k == key && v == value) {
+                // Mark as deleted
+                db_file.clear();
+                db_file.seekp(entry_start);
+                uint8_t del = 1;
+                db_file.write(reinterpret_cast<char*>(&del), 1);
+                db_file.flush();
                 return;
             }
         }
-        pos = block->next_block_pos;
-        delete block;
+        pos = next_block;
     }
 }
 
@@ -226,14 +216,20 @@ void find(const string& key) {
     vector<int> values;
 
     while (pos >= 0) {
-        Block* block = read_block(pos);
-        for (const auto& e : block->entries) {
-            if (!e.deleted && e.key == key) {
-                values.push_back(e.value);
+        int next_block, num_entries, data_start;
+        if (!read_block_header(pos, next_block, num_entries, data_start)) break;
+
+        int read_pos = data_start;
+        for (int i = 0; i < num_entries; i++) {
+            bool deleted;
+            string k;
+            int v;
+            if (!read_entry(read_pos, deleted, k, v)) break;
+            if (!deleted && k == key) {
+                values.push_back(v);
             }
         }
-        pos = block->next_block_pos;
-        delete block;
+        pos = next_block;
     }
 
     if (values.empty()) {
