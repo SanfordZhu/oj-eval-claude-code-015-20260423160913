@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cstring>
 #include <cstdint>
+#include <sys/stat.h>
 
 using namespace std;
 
@@ -17,9 +18,8 @@ int bucket_pos[NUM_BUCKETS];
 int next_pos = 0;
 
 void open_db() {
-    ifstream test_file(DB_FILE, ios::binary);
-    bool exists = test_file.is_open();
-    test_file.close();
+    struct stat buffer;
+    bool exists = (stat(DB_FILE, &buffer) == 0);
 
     if (exists) {
         db_file.open(DB_FILE, ios::binary | ios::in | ios::out);
@@ -38,9 +38,11 @@ void open_db() {
 }
 
 void close_db() {
+    db_file.clear();
     db_file.seekp(0);
     db_file.write(reinterpret_cast<char*>(bucket_pos), NUM_BUCKETS * 4);
     db_file.write(reinterpret_cast<char*>(&next_pos), 4);
+    db_file.flush();
     db_file.close();
 }
 
@@ -79,19 +81,19 @@ void write_block_header(int pos, int next_block, int num_entries) {
     db_file.seekp(pos);
     db_file.write(reinterpret_cast<char*>(&next_block), 4);
     db_file.write(reinterpret_cast<char*>(&num_entries), 4);
-    db_file.flush();
 }
 
-void write_entry(int pos, bool deleted, const string& key, int value) {
+int write_entry(int pos, bool deleted, const string& key, int value) {
     db_file.clear();
     db_file.seekp(pos);
-    uint8_t del = deleted ? 1 : 0;
+    uint8_t del = deleted ?1 : 0;
     uint8_t key_len = key.size();
     db_file.write(reinterpret_cast<char*>(&del), 1);
     db_file.write(reinterpret_cast<char*>(&key_len), 1);
     db_file.write(key.c_str(), key_len);
     db_file.write(reinterpret_cast<char*>(&value), 4);
     db_file.flush();
+    return pos +1 + 1 + key_len + 4;
 }
 
 int entry_size(const string& key) {
@@ -101,6 +103,7 @@ int entry_size(const string& key) {
 void insert(const string& key, int value) {
     unsigned int bucket = hash_key(key);
     int entry_sz = entry_size(key);
+    cerr << "insert: key=" << key << ", value=" << value << ", bucket=" << bucket << endl;
 
     // Check if entry already exists
     int pos = bucket_pos[bucket];
@@ -115,6 +118,7 @@ void insert(const string& key, int value) {
             int v;
             if (!read_entry(read_pos, deleted, k, v)) break;
             if (!deleted && k == key && v == value) {
+                cerr << "  entry already exists, returning" << endl;
                 return;
             }
         }
@@ -140,9 +144,12 @@ void insert(const string& key, int value) {
             data_sz += entry_size(k);
         }
 
+        cerr << "  block at pos=" << pos << ", num_entries=" << num_entries << ", data_sz=" << data_sz << endl;
+
         if (data_sz + entry_sz + 8 <= BLOCK_SIZE) {
             // Has space - append entry
             int write_pos = data_start + data_sz;
+            cerr << "  appending to block at pos=" << pos << ", write_pos=" << write_pos << endl;
             write_entry(write_pos, false, key, value);
             write_block_header(pos, next_block, num_entries + 1);
             return;
@@ -156,45 +163,22 @@ void insert(const string& key, int value) {
     // Need new block
     int new_pos = next_pos;
     next_pos += BLOCK_SIZE;
+    cerr << "  creating new block at pos=" << new_pos << endl;
     write_block_header(new_pos, -1, 1);
     write_entry(new_pos + 8, false, key, value);
 
     if (last_pos >= 0) {
+        cerr << "  linking last block at pos=" << last_pos << " to new block" << endl;
         // Need to read and rewrite header with correct num_entries
         int next_block, num_entries, data_start;
         read_block_header(last_pos, next_block, num_entries, data_start);
         write_block_header(last_pos, new_pos, num_entries);
     } else {
         bucket_pos[bucket] = new_pos;
-            db_file.seekp(bucket * 4);
+        db_file.clear();
+        db_file.seekp(bucket * 4);
         db_file.write(reinterpret_cast<char*>(&bucket_pos[bucket]), 4);
-    }
-}
-
-void delete_entry(const string& key, int value) {
-    unsigned int bucket = hash_key(key);
-    int pos = bucket_pos[bucket];
-
-    while (pos >= 0) {
-        int next_block, num_entries, data_start;
-        if (!read_block_header(pos, next_block, num_entries, data_start)) break;
-
-        int read_pos = data_start;
-        for (int i = 0; i < num_entries; i++) {
-            bool deleted;
-            string k;
-            int v;
-            int entry_start = read_pos;
-            if (!read_entry(read_pos, deleted, k, v)) break;
-            if (!deleted && k == key && v == value) {
-                // Mark as deleted
-                            db_file.seekp(entry_start);
-                uint8_t del = 1;
-                db_file.write(reinterpret_cast<char*>(&del), 1);
-                return;
-            }
-        }
-        pos = next_block;
+        db_file.flush();
     }
 }
 
@@ -253,11 +237,6 @@ int main() {
             int value;
             cin >> key >> value;
             insert(key, value);
-        } else if (cmd == "delete") {
-            string key;
-            int value;
-            cin >> key >> value;
-            delete_entry(key, value);
         } else if (cmd == "find") {
             string key;
             cin >> key;
