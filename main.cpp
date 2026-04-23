@@ -10,7 +10,7 @@ using namespace std;
 
 const char* DB_FILE = "database.dat";
 const int NUM_BUCKETS = 10007;
-const int BLOCK_SIZE = 512;
+const int BLOCK_SIZE = 4096;  // 4KB blocks to reduce number of blocks
 
 fstream db_file;
 int bucket_pos[NUM_BUCKETS];
